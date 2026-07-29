@@ -1,0 +1,365 @@
+import asyncio
+import sqlite3
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import (
+Message, ReplyKeyboardMarkup, KeyboardButton,
+InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+ReplyKeyboardRemove
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.client.session.aiohttp import AiohttpSession
+
+================= MAXFIY SOZLAMALAR =================
+BOT_TOKEN = "8978252829:AAEz5vbsCdoJ4bxjAV4lKXkKijVM7wD18v8"
+DIREKTOR_ID = 190833887 # Sizning Telegram ID raqamingiz
+======================================================
+
+dp = Dispatcher()
+
+--- BAZA BILAN ISHLASH ---
+def init_db():
+conn = sqlite3.connect("kassa.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS operatsiyalar (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+user_id INTEGER,
+user_name TEXT,
+turi TEXT,
+valyuta TEXT,
+summa REAL,
+vaqt DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS xodimlar (
+user_id INTEGER PRIMARY KEY,
+full_name TEXT,
+phone_number TEXT
+)
+""")
+conn.commit()
+conn.close()
+
+def db_add_xodim(user_id, full_name, phone_number):
+conn = sqlite3.connect("kassa.db")
+cursor = conn.cursor()
+cursor.execute(
+"INSERT OR REPLACE INTO xodimlar (user_id, full_name, phone_number) VALUES (?, ?, ?)",
+(user_id, full_name, phone_number)
+)
+conn.commit()
+conn.close()
+
+def db_is_xodim(user_id):
+if user_id == DIREKTOR_ID:
+return True
+conn = sqlite3.connect("kassa.db")
+cursor = conn.cursor()
+cursor.execute("SELECT user_id FROM xodimlar WHERE user_id = ?", (user_id,))
+res = cursor.fetchone()
+conn.close()
+return res is not None
+
+def db_add_operation(user_id, user_name, turi, valyuta, summa):
+conn = sqlite3.connect("kassa.db")
+cursor = conn.cursor()
+cursor.execute(
+"INSERT INTO operatsiyalar (user_id, user_name, turi, valyuta, summa) VALUES (?, ?, ?, ?, ?)",
+(user_id, user_name, turi, valyuta, summa)
+)
+conn.commit()
+conn.close()
+
+def db_get_balance():
+conn = sqlite3.connect("kassa.db")
+cursor = conn.cursor()
+cursor.execute("SELECT SUM(CASE WHEN turi = 'kirim' THEN summa ELSE -summa END) FROM operatsiyalar WHERE valyuta = 'UZS'")
+uzs = cursor.fetchone()[0] or 0.0
+cursor.execute("SELECT SUM(CASE WHEN turi = 'kirim' THEN summa ELSE -summa END) FROM operatsiyalar WHERE valyuta = 'USD'")
+usd = cursor.fetchone()[0] or 0.0
+conn.close()
+return uzs, usd
+
+def db_get_staff_report():
+conn = sqlite3.connect("kassa.db")
+cursor = conn.cursor()
+cursor.execute("""
+SELECT user_name, valyuta, SUM(summa)
+FROM operatsiyalar
+WHERE turi = 'kirim'
+GROUP BY user_id, valyuta
+""")
+rows = cursor.fetchall()
+conn.close()
+return rows
+
+--- HOLATLAR (FSM) ---
+class Form(StatesGroup):
+wait_phone = State()
+wait_kirim_valyuta = State()
+wait_kirim_summa = State()
+wait_chiqim_valyuta = State()
+wait_chiqim_summa = State()
+
+--- KLAVIATURALAR ---
+def get_main_keyboard(is_director=False):
+kb = [
+[KeyboardButton(text="📥 Kunlik tushum (Kirim)")],
+[KeyboardButton(text="📊 Umumiy Balans (Qoldiq)")]
+]
+if is_director:
+kb.append([KeyboardButton(text="💸 Kassadan pul olish (Chiqim)")])
+kb.append([KeyboardButton(text="👥 Xodimlar bo'yicha hisobot")])
+return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+currency_kb = ReplyKeyboardMarkup(
+keyboard=[
+[KeyboardButton(text="🇺🇿 So'm (UZS)"), KeyboardButton(text="🇺🇸 Dollar (USD)")],
+[KeyboardButton(text="❌ Bekor qilish")]
+],
+resize_keyboard=True
+)
+
+phone_kb = ReplyKeyboardMarkup(
+keyboard=[
+[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]
+],
+resize_keyboard=True,
+one_time_keyboard=True
+)
+
+--- START ---
+@dp.message(Command("start"))
+async def start_cmd(message: Message, state: FSMContext):
+await state.clear()
+user_id = message.from_user.id
+
+if user_id == DIREKTOR_ID:
+await message.answer(
+"👑 Xush kelibsiz, Direktor!\nBoshqaruv menyusi:",
+reply_markup=get_main_keyboard(True),
+parse_mode="Markdown"
+)
+elif db_is_xodim(user_id):
+await message.answer(
+"👷‍♂️ Xush kelibsiz!\nKerakli bo'limni tanlang:",
+reply_markup=get_main_keyboard(False),
+parse_mode="Markdown"
+)
+else:
+await state.set_state(Form.wait_phone)
+await message.answer(
+"👋 Assalomu alaykum!\nTizimdan foydalanish uchun pastdagi tugmani bosib telefon raqamingizni yuboring:",
+reply_markup=phone_kb
+)
+
+--- TELEFON RAQAM QABUL QILISH ---
+@dp.message(Form.wait_phone, F.contact)
+async def process_phone_register(message: Message, state: FSMContext, bot: Bot):
+phone_number = message.contact.phone_number
+full_name = message.from_user.full_name
+user_id = message.from_user.id
+
+await state.clear()
+await message.answer("⏳ So'rovingiz direktorga yuborildi. Tasdiqlanishini kuting...", reply_markup=ReplyKeyboardRemove())
+
+approve_kb = InlineKeyboardMarkup(inline_keyboard=[
+[
+InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"accept_{user_id}{phone_number}"),
+InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject{user_id}")
+ ]
+])
+
+await bot.send_message(
+DIREKTOR_ID,
+f"🆕 Yangi xodim ro'yxatdan o'tmoqchi!\n\n"
+f"👤 Ism: {full_name}\n"
+f"📞 Tel:{phone_number}\n"
+f"🆔 ID:{user_id}\n\n"
+f"Ushbu xodimga ruxsat berasizmi?",
+parse_mode="Markdown",
+reply_markup=approve_kb
+)
+
+@dp.callback_query(F.data.startswith("accept_"))
+async def accept_xodim(callback: CallbackQuery, bot: Bot):
+parts = callback.data.split("_")
+user_id = int(parts[1])
+phone_number = parts[2]
+
+try:
+user_info = await bot.get_chat(user_id)
+full_name = user_info.full_name or "Xodim"
+except Exception:
+full_name = "Xodim"
+
+db_add_xodim(user_id, full_name, phone_number)
+await callback.message.edit_text(f"✅ {full_name} ({phone_number}) xodimlar safiga qo'shildi!", parse_mode="Markdown")
+try:
+await bot.send_message(user_id, "🎉 Sizning so'rovingiz tasdiqlandi!", reply_markup=get_main_keyboard(False), parse_mode="Markdown")
+except Exception: pass
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_xodim(callback: CallbackQuery, bot: Bot):
+user_id = int(callback.data.split("_")[1])
+await callback.message.edit_text("❌ So'rov rad etildi.")
+try: await bot.send_message(user_id, "⛔️ So'rovingiz rad etildi.")
+except Exception: pass
+
+@dp.message(F.text == "❌ Bekor qilish")
+async def cancel_cmd(message: Message, state: FSMContext):
+await state.clear()
+is_director = (message.from_user.id == DIREKTOR_ID)
+await message.answer("Bosh menyuga qaytdingiz.", reply_markup=get_main_keyboard(is_director))
+
+--- KIRIM QILISH ---
+@dp.message(F.text.contains("Kunlik tushum"))
+async def ask_kirim_val(message: Message, state: FSMContext):
+if not db_is_xodim(message.from_user.id): return
+await state.set_state(Form.wait_kirim_valyuta)
+await message.answer("Valyutani tanlang:", reply_markup=currency_kb)
+
+@dp.message(Form.wait_kirim_valyuta, F.text.in_(["🇺🇿 So'm (UZS)", "🇺🇸 Dollar (USD)"]))
+async def ask_kirim_sum(message: Message, state: FSMContext):
+valyuta = "UZS" if "So'm" in message.text else "USD"
+await state.update_data(valyuta=valyuta)
+await state.set_state(Form.wait_kirim_summa)
+unit = "so'm" if valyuta == "UZS" else "$`"
+await message.answer(f"Topshiradigan summani kiriting ({unit}):", reply_markup=ReplyKeyboardRemove())
+
+@dp.message(Form.wait_kirim_summa)
+async def proc_kirim(message: Message, state: FSMContext, bot: Bot):
+try:
+summa = float(message.text.replace(" ", ""))
+data = await state.get_data()
+valyuta = data['valyuta']
+user_name = message.from_user.full_name
+is_director = (message.from_user.id == DIREKTOR_ID)
+
+db_add_operation(message.from_user.id, user_name, "kirim", valyuta, summa)
+uzs_bal, usd_bal = db_get_balance()
+unit = "so'm" if valyuta == "UZS" else "`$"
+
+await message.answer(
+f"✅ {summa:,.2f} {unit} kirim qilindi!\n\n"
+f"🏛 Hozirgi Kassa Qoldig'i:\n"
+f"🇺🇿 UZS: {uzs_bal:,.0f} so'm\n"
+f"🇺🇸 USD: {usd_bal:,.2f} $`",
+parse_mode="Markdown",
+reply_markup=get_main_keyboard(is_director)
+)
+await state.clear()
+
+if not is_director:
+await bot.send_message(
+DIREKTOR_ID,
+f"📥 Yangi tushum!\n👤 Xodim: {user_name}\n💵 Summa: {summa:,.2f} {unit}\n\n"
+f"🏛 Yangi Kassa Qoldig'i:\n🇺🇿 UZS: {uzs_bal:,.0f} so'm\n🇺🇸 USD: {usd_bal:,.2f} `$",
+parse_mode="Markdown"
+)
+except ValueError:
+await message.answer("Iltimos, summani faqat raqamda kiriting:")
+
+--- CHIQIM QILISH ---
+@dp.message(F.text.contains("Kassadan pul olish"))
+async def ask_chiqim_val(message: Message, state: FSMContext):
+if message.from_user.id != DIREKTOR_ID:
+await message.answer("⛔️ Bu bo'lim faqat Direktor uchun!")
+return
+await state.set_state(Form.wait_chiqim_valyuta)
+await message.answer("Qaysi valyutada pul olmoqchisiz?", reply_markup=currency_kb)
+
+@dp.message(Form.wait_chiqim_valyuta, F.text.in_(["🇺🇿 So'm (UZS)", "🇺🇸 Dollar (USD)"]))
+async def ask_chiqim_sum(message: Message, state: FSMContext):
+valyuta = "UZS" if "So'm" in message.text else "USD"
+await state.update_data(valyuta=valyuta)
+await state.set_state(Form.wait_chiqim_summa)
+unit = "so'm" if valyuta == "UZS" else "$`"
+await message.answer(f"Kassadan oladigan summani kiriting ({unit}):", reply_markup=ReplyKeyboardRemove())
+
+@dp.message(Form.wait_chiqim_summa)
+async def proc_chiqim(message: Message, state: FSMContext):
+try:
+summa = float(message.text.replace(" ", ""))
+data = await state.get_data()
+valyuta = data['valyuta']
+user_name = message.from_user.full_name
+
+db_add_operation(message.from_user.id, user_name, "chiqim", valyuta, summa)
+uzs_bal, usd_bal = db_get_balance()
+
+check_bal = uzs_bal if valyuta == "UZS" else usd_bal
+unit = "so'm" if valyuta == "UZS" else "`$"
+status = "🟢 Balans yetarli." if check_bal >= 0 else f"🔴 DIQQAT: {valyuta} balansi MINUSGA kirdi!"
+
+await message.answer(
+f"💸 Kassadan {summa:,.2f} {unit} olindi.\n\n"
+f"🏛 Qoldiq Rezerv:\n"
+f"🇺🇿 UZS: {uzs_bal:,.0f} so'm\n"
+f"🇺🇸 USD: {usd_bal:,.2f} $` \n\n"
+f"{status}",
+parse_mode="Markdown",
+reply_markup=get_main_keyboard(True)
+)
+await state.clear()
+except ValueError:
+await message.answer("Iltimos, summani faqat raqamda kiriting:")
+
+--- BALANS ---
+@dp.message(F.text.contains("Umumiy Balans"))
+async def show_bal(message: Message):
+if not db_is_xodim(message.from_user.id): return
+uzs_bal, usd_bal = db_get_balance()
+uzs_st = "🟢" if uzs_bal >= 0 else "🔴 (Minus)"
+usd_st = "🟢" if usd_bal >= 0 else "🔴 (Minus)"
+
+await message.answer(
+f"🏛 Umumiy Kassa / Rezerv Qoldig'i:\n\n"
+f"🇺🇿 So'm: {uzs_bal:,.0f} so'm {uzs_st}\n"
+f"🇺🇸 Dollar: {usd_bal:,.2f} `$ {usd_st}",
+parse_mode="Markdown"
+)
+
+--- HISOBOT ---
+@dp.message(F.text.contains("Xodimlar bo'yicha hisobot"))
+async def show_staff_report(message: Message):
+if message.from_user.id != DIREKTOR_ID:
+await message.answer("⛔️ Bu bo'lim faqat Direktor uchun!")
+return
+
+data = db_get_staff_report()
+if not data:
+await message.answer("Hozircha xodimlardan hech qanday tushum kiritilmagan.")
+return
+
+text = "👥 Xodimlarning umumiy topshirgan pullari:\n\n"
+for name, valyuta, summa in data:
+unit = "so'm" if valyuta == "UZS" else "$"
+text += f"👤 {name}: {summa:,.2f} {unit}\n"
+
+await message.answer(text, parse_mode="Markdown")
+
+--- ISHGA TUSHIRISH ---
+async def main():
+init_db()
+
+session = AiohttpSession(timeout=60)
+current_bot = Bot(token=BOT_TOKEN, session=session)
+
+try:
+await current_bot.delete_webhook(drop_pending_updates=True)
+await dp.start_polling(current_bot, polling_timeout=30)
+finally:
+await current_bot.session.close()
+
+if name == "main":
+import time
+while True:
+try:
+asyncio.run(main())
+except Exception as e:
+print(f"Tarmoqda uzilish: {e}. 5 soniyadan so'ng qayta ulanadi...")
+time.sleep(5)
